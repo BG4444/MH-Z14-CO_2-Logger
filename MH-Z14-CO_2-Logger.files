@@ -1,14 +1,2 @@
-user/linked_list.h
-user/logger.c
-user/logger.h
-user/strbuf.c
-user/strbuf.h
-user/websrvr.c
-Makefile
-user/net_config.h
-user/tar.c
-user/tar.h
-user/tcp_streamer.c
-user/tcp_streamer.h
 user/user_config.h
 user/user_main.c
