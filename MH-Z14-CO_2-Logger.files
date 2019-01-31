@@ -1,2 +1,15 @@
+ESPWEB/linked_list.h
+ESPWEB/logger.c
+ESPWEB/logger.h
+ESPWEB/strbuf.c
+ESPWEB/strbuf.h
+ESPWEB/tar.c
+ESPWEB/tar.h
+ESPWEB/tcp_streamer.c
+ESPWEB/tcp_streamer.h
+ESPWEB/websrvr.c
+ESPWEB/websrvr.h
+user/www.c
+Makefile
 user/user_config.h
 user/user_main.c

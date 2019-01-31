@@ -11,16 +11,23 @@
 #include "strbuf.h"
 #include "websrvr.h"
 #include "tar.h"
+#include "driver/uart.h"
+
 
 static void at_tcpclient_connect_cb(void *arg);
+static void ICACHE_FLASH_ATTR at_tcpclient_sent_cb(void *arg);
 
 static volatile os_timer_t WiFiLinker;
 
 volatile unsigned int nClients=0;
+
+volatile size_t sender_watchdog=0;
+
 bool connected=false;
 
 static void ICACHE_FLASH_ATTR at_tcpclient_recon_cb(void *arg, sint8 err)
 {
+    os_printf("reconnect");
     struct espconn *pespconn = (struct espconn *)arg;
 
     tcp_streamer* cur1=find_item(streamsOut,pespconn);
@@ -42,8 +49,6 @@ static void ICACHE_FLASH_ATTR at_tcpclient_recon_cb(void *arg, sint8 err)
 
 static void ICACHE_FLASH_ATTR senddata()
 {
-        char info[150];
-        char tcpserverip[15];
         struct espconn *pCon = (struct espconn *)os_zalloc(sizeof(struct espconn));
         if (pCon == NULL)
         {
@@ -66,18 +71,37 @@ static void ICACHE_FLASH_ATTR senddata()
 }
 
 static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
-{        
+{
+        os_printf("next timer round %d\n",nTicks);
+
+
+        if(is_sending && ++sender_watchdog==4 )
+        {
+            at_tcpclient_sent_cb(0);
+
+        }
+
         for(tcp_streamer* current=streamsOut;current;current=current->next)
         {
-            if(current->mode==LongPoll && --current->timer == 0)
+            if(current->mode==LongPoll )
             {
-                const char status ='0'+getPinStatus();
-                strBuf send;
+                if(--current->timer == 0)
+                {
+                    os_printf("timeout - sending status, current sending is %d\n",is_sending);
+                    const char status ='0';//+getPinStatus();
+                    strBuf send;
 
-                sendStatus(status,&send);
-                sendStringNoCopy(current,&send);
-            }
+                    sendStatus(status,&send);
+                    sendStringNoCopy(current,&send);
+
+                }
+                else
+                {
+                    os_printf("no timeout, current sending is %d\n",is_sending);
+                }
+            }            
         }
+        os_printf("long polls processed\n");
 
 
         ++nTicks;
@@ -106,7 +130,7 @@ static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
                 connected=true;
                 // Запускаем таймер проверки соединения и отправки данных уже раз в 5 сек, см. тех.задание
                 os_timer_setfn(&WiFiLinker, (os_timer_func_t *)wifi_check_ip, NULL);
-                os_timer_arm(&WiFiLinker, 5000, 0);
+                os_timer_arm(&WiFiLinker, 1000, 0);
         }
         else
         {
@@ -154,79 +178,146 @@ static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
         }
 }
 
+void begin_new_sending()
+{
+    for(tcp_streamer* current=streamsOut; current; current=current->next)
+    {
+        const StreamMode md=current->mode;
+        switch(md)
+        {
+            case SendString:
+                current->mode=KillMeNoDisconnect;
+            break;
+            case SendFile:
+                current->mode=File;
+            break;
+            case LogDumpHeaders:
+                current->mode=LogDump;
+            break;
+            default:
+                continue;
+        }
+        os_printf("send header mode=%d -> %d\n",md,current->mode);
+
+        current_sending=current->pEspCon;
+
+
+        espconn_sent(current->pEspCon, current->string.begin, current->string.len);
+        os_printf("send header done\n",md,current->mode);
+
+        log_free(current->string.begin);
+        LOG_CLIENT("next headers sent",current->pEspCon);
+
+        return;
+    }
+
+    os_printf("no next headers\n");
+    is_sending=false;
+}
+
 static void ICACHE_FLASH_ATTR at_tcpclient_sent_cb(void *arg)
 {
+    sender_watchdog=0;
     struct espconn *pespconn = (struct espconn *)arg;
+    os_printf("end writing to TCP %d\n");
 
-    tcp_streamer* cur=find_item(streamsOut,pespconn);
-
-    if(cur)
+    if(streamsOut)
     {
-        switch(cur->mode)
+        switch(streamsOut->mode)
         {
             case File:
-                send_item(cur);
-            break;
-            case LogDump:
-                espconn_sent(cur->pCon,  cur->logPos->message.begin, cur->logPos->message.len);                
-                cur->logLen-=cur->logPos->message.len;
-
-                const log_entry* tnext=cur->logPos->next;
-
-                log_free(cur->logPos->message.begin);
-                log_free(cur->logPos);
-
-                if(cur->logLen)
-                {                    
-                    cur->logPos=tnext;
+                os_printf("file\n");
+                if(arg)
+                {
+                    send_item(streamsOut);
                 }
                 else
-                {                    
-                    cur->mode=KillMeNoDisconnect;
-                }
-
-
-            break;
-            case KillMe:
-                espconn_disconnect(pespconn);
-            case KillMeNoDisconnect:
-                delete_tcp_streamer_item(&streamsOut, cur);
-                LOG_CLIENT("Query done",pespconn);
-
-
-                tcp_streamer* current=streamsOut;
-                for(; current; current=current->next)
                 {
-                    switch(current->mode)
+                    os_printf("force file send\n");
+                    delete_tcp_streamer_item(&streamsOut, streamsOut);
+                    begin_new_sending();
+                }
+            break;
+            case LogDump:
+            {
+                os_printf("sending part of log\n");
+
+                if(arg)
+                {
+                    current_sending=streamsOut->pEspCon;
+                    espconn_sent(streamsOut->pEspCon,  streamsOut->logPos->message.begin, streamsOut->logPos->message.len);
+                    const log_entry* tnext=streamsOut->logPos->next;
+
+    //                os_printf("message free %d\n",cur->logPos->message.begin);
+                    log_free(streamsOut->logPos->message.begin);
+
+    //                os_printf("node free %d\n",cur->logPos);
+                    log_free(streamsOut->logPos);
+
+
+                    if(tnext)
                     {
-                        case SendString:
-                            current->mode=KillMeNoDisconnect;
-                        break;
-                        case SendFile:
-                            current->mode=File;
-                        break;
-                        case LogDumpHeaders:
-                            current->mode=LogDump;
-                        break;
-                        default:
-                            continue;
+                        streamsOut->logPos=tnext;
                     }
-                    espconn_sent(current->pCon, current->string.begin, current->string.len);
-                    log_free(current->string.begin);
-                    break;
+                    else
+                    {
+    //                    os_printf("all data sent\n");
+                        streamsOut->mode=KillMeNoDisconnect;
+                    }
+    //                os_printf("sending done\n");
+
                 }
-                if(!current)
+                else
                 {
-                    is_sending=false;
+                    os_printf("force log clean\n");
+                    for(log_entry* le=streamsOut->logPos; le; )
+                    {
+                        log_entry* t=le->next;
+                        log_free(le->message.begin);
+                        log_free(le);
+                        le=t;
+                    }
+                    delete_tcp_streamer_item(&streamsOut, streamsOut);
+                    begin_new_sending();
                 }
+
+                break;
+            }
+            case KillMe:
+                os_printf("force disconnect\n");
+                if(pespconn)
+                {
+                    espconn_disconnect(pespconn);
+                }
+            case KillMeNoDisconnect:
+                os_printf("kill no disconnect\n");
+                delete_tcp_streamer_item(&streamsOut, streamsOut);
+                if(pespconn)
+                {
+                    LOG_CLIENT("Query done",pespconn);
+                }
+                begin_new_sending();
             break;
-        }
+        }        
+//        if(streamsOut)
+//        {
+//            tcp_streamer** current=&streamsOut;
+//            for(;*current;current=&(*current)->next);
+//            *current=streamsOut;
+//            streamsOut=streamsOut->next;
+//            (*current)->next=0;
+//        }
+    }
+    else
+    {
+        os_printf("ITEM NOT FOUND\n");
     }
 }
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_recv_cb(void *arg,char *pdata, unsigned short len)
 {
+    os_printf("new data from client");
     struct espconn *pespconn = (struct espconn *)arg;
 
     tcp_streamer* f=find_item(streamsInp,pespconn);
@@ -261,7 +352,7 @@ static void ICACHE_FLASH_ATTR at_tcpclient_recv_cb(void *arg,char *pdata, unsign
 
             tcp_streamer* s = add_tcp_streamer_item(&streamsInp);
 
-            s->pCon=pespconn;
+            setCon(s,pespconn);
 
             s->mode=Head;
 
@@ -276,25 +367,47 @@ static void ICACHE_FLASH_ATTR at_tcpclient_recv_cb(void *arg,char *pdata, unsign
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_discon_cb(void *arg)
-{
+{     
         struct espconn *pespconn = (struct espconn *)arg;
         // Отключились, освобождаем память
-       // log_free(pespconn->proto.tcp);
-       // log_free(pespconn);
-        #ifdef PLATFORM_DEBUG
-        uart0_sendStr("Disconnect callback\r\n");
-        #endif
+       LOG_CLIENT("Client disconnect",pespconn);
+
+       bool someDeleted = false;
+
+       while(true)
+       {
+           tcp_streamer* cur=find_socket(streamsOut,pespconn);
+
+           if(cur)
+           {
+               os_printf("delete sending queue\n");
+               delete_tcp_streamer_item(&streamsOut, cur);
+               someDeleted=true;
+           }
+           else
+           {
+               os_printf("not found in queue\n");
+               break;
+           }
+       }
+
+       if(is_sending && someDeleted)
+       {
+            os_printf("restart sending\n");
+            begin_new_sending();
+       }
 
         --nClients;
 
-        LOG_CLIENT("Client disconnect",pespconn);
 
+        os_printf("client disconnect finally\n");
 }
 
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_connect_cb(void *arg)
 {
+        os_printf("new connect");
         struct espconn *pespconn = (struct espconn *)arg;
         #ifdef PLATFORM_DEBUG
         uart0_sen mem_usage+=size;
@@ -327,13 +440,19 @@ void BtnInit()
 //Init function 
 void ICACHE_FLASH_ATTR user_init()
 {
+    uart_div_modify(0, UART_CLK_FREQ / 9600);
+
             MAKE_STR_BUF(systemInit,"Init system\n");
             MAKE_STR_BUF(systemInitDone,"Init done\n");
             MAKE_STR_BUF(wifiConfigSet,"WiFi SET\n");
 
-            add_message(&systemInit, nTicks);
+            add_message_copy(&systemInit, nTicks);
 
-            uart0_sendStr("ESP8266 platform starting...\r\n");
+
+
+            os_printf("uint8 *buf", 8);
+//            system_set_os_print(0);
+
 
             // Структура с информацией о конфигурации STA (в режиме клиента AP)
             struct station_config stationConfig;
@@ -357,7 +476,7 @@ void ICACHE_FLASH_ATTR user_init()
                     wifi_station_set_config(&stationConfig);
             }
 
-            add_message(&wifiConfigSet, nTicks);
+            add_message_copy(&wifiConfigSet, nTicks);
             // Для отладки выводим в uart данные о настройке режима STA
 
             // Запускаем таймер проверки соединения по Wi-Fi, проверяем соединение раз в 1 сек., если соединение установлено, то запускаем TCP-клиент и отправляем тестовую строку.
@@ -367,5 +486,5 @@ void ICACHE_FLASH_ATTR user_init()
             // Инициализируем GPIO,
             BtnInit();
             // Выводим сообщение о успешном запуске
-            add_message(&systemInitDone, nTicks);
+            add_message_copy(&systemInitDone, nTicks);
 }
