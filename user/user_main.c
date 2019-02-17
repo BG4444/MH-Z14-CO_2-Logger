@@ -7,11 +7,10 @@
 #include "gpio.h"
 #include "user_config.h"
 #include "net_config.h"
-#include "tcp_streamer.h"
-#include "strbuf.h"
-#include "websrvr.h"
-#include "tar.h"
 #include "driver/uart.h"
+
+#include "driver/uart_register.h"
+volatile uint32_t addr=0;
 
 
 static void at_tcpclient_connect_cb(void *arg);
@@ -21,31 +20,17 @@ static volatile os_timer_t WiFiLinker;
 
 volatile unsigned int nClients=0;
 
-volatile size_t sender_watchdog=0;
-
 bool connected=false;
 
-static void ICACHE_FLASH_ATTR at_tcpclient_recon_cb(void *arg, sint8 err)
-{
-    os_printf("reconnect");
-    struct espconn *pespconn = (struct espconn *)arg;
+size_t BUFFER_MAX = 16384;
+size_t headerLen;
 
-    tcp_streamer* cur1=find_item(streamsOut,pespconn);
+char* buffer;
+char* bufferTitle;
+size_t bufferLen=0;
 
-    if(cur1)
-    {
-        delete_tcp_streamer_item(&streamsOut, cur1);
-    }
+extern UartDevice UartDev;
 
-    tcp_streamer* cur2=find_item(streamsInp,pespconn);
-
-    if(cur2)
-    {
-        delete_tcp_streamer_item(&streamsInp, cur2);
-    }
-
-     LOG_CLIENT("TCP error",pespconn);
-}
 
 static void ICACHE_FLASH_ATTR senddata()
 {
@@ -70,41 +55,189 @@ static void ICACHE_FLASH_ATTR senddata()
         espconn_regist_time(pCon, 60*60, 0);
 }
 
+static void ICACHE_FLASH_ATTR append_buffer(char* text)
+{
+
+    const size_t len=strlen(text);
+
+    size_t i=0;
+    while(bufferLen + len -i > BUFFER_MAX )
+    {
+        while(buffer[i++] !='\n');
+    }
+
+    bufferLen-=i;
+    memmove(buffer,buffer+i,bufferLen);
+    memcpy(buffer+bufferLen,text,len);
+    bufferLen+=len;
+}
+
+static uint8 ICACHE_FLASH_ATTR computeCRC(uint8* command)
+{
+    uint8 ret=0;
+    for(size_t i=1;i<8;++i)
+    {
+        ret+=command[i];
+    }
+    return ~ret+1;
+}
+
+static void ICACHE_FLASH_ATTR setCRC(uint8* command)
+{
+    command[8]=computeCRC(command);
+}
+
+static int ICACHE_FLASH_ATTR uart1_tx_one_char(uint8 TxChar)
+{
+    while (true)
+    {
+        uint32 fifo_cnt = READ_PERI_REG(UART_STATUS(1)) & (UART_TXFIFO_CNT<<UART_TXFIFO_CNT_S);
+        if ((fifo_cnt >> UART_TXFIFO_CNT_S & UART_TXFIFO_CNT) < 126) {
+            break;
+        }
+    }
+
+    WRITE_PERI_REG(UART_FIFO(1) , TxChar);
+    return OK;
+}
+
+void ICACHE_FLASH_ATTR sendScreen(uint8_t chr,uint8_t  cmd)
+{
+    const uint16_t controlWord= ((((uint16_t)cmd<<8) | (uint16_t)chr))<<4;
+    const uint8_t hi=controlWord >> 8;
+    const uint8_t lo=controlWord & 0xFF;
+    const uint8_t crc=hi ^ lo;
+    uart1_tx_one_char(0xFF);
+    uart1_tx_one_char(hi);
+    uart1_tx_one_char(crc);
+    uart1_tx_one_char(lo);
+}
+
+void clrscr()
+{
+    sendScreen(0x01,1);
+}
+
+void line2()
+{
+    sendScreen(0x40 | 0b10000000,1);
+}
+
+void printStr(const char* str)
+{
+    for(;*str;++str)
+    {
+          sendScreen(*str,0);
+    }
+}
+
+void alignPrint(const char* buf)
+{
+    const int slen=strlen(buf);
+
+    for(int i=0;i<(16-slen)/2;++i)
+    {
+        sendScreen(' ',0);
+    }
+    printStr(buf);
+}
+
+void showIP(uint32_t ip)
+{
+    char buf[32]={0};
+    for(size_t i=0;i<4;++i,ip>>=8)
+    {
+        const uint8_t octet=ip & 0xFF;
+        char lbuf[5];
+        os_sprintf(lbuf,"%u",octet);
+        strcat(buf,lbuf);
+
+        if(i<3)
+        {
+            strcat(buf,".");
+        }
+    }
+    alignPrint(buf);
+}
+
+static void ICACHE_FLASH_ATTR getMeasurements()
+{
+    static const uint8 command[9]={0xFF,0x01,0x86,1,2,3,4,5,6};
+    static uint16_t COLevel=0;
+    setCRC(command);
+    static size_t nTicks=0;
+
+    if(COLevel>2500)
+    {
+        sendScreen(nTicks & 0x01 ? 0 : 7,2);
+    }
+    else if(COLevel>1500)
+    {
+        sendScreen(nTicks & 0x01 ? 3 : 4,2);
+    }
+    else  if(COLevel>1200)
+    {
+        sendScreen(nTicks & 0x01 ? 0 : 3,2);
+    }
+    else if(COLevel>800)
+    {
+        sendScreen(nTicks & 0x01 ? 1 : 2,2);
+    }
+    else
+    {
+        sendScreen(0,2);
+    }
+
+
+    if(++nTicks == 10)
+    {
+
+        nTicks=0;
+        uart0_tx_buffer(command,9);
+        while((READ_PERI_REG(UART_STATUS(0))>>UART_TXFIFO_CNT_S) &UART_TXFIFO_CNT);
+    }
+
+    if( ((READ_PERI_REG(UART_STATUS(0))>>UART_RXFIFO_CNT_S) &UART_RXFIFO_CNT) >= 9)
+    {
+        uint8 reply[9];
+        for(size_t i=0;i<9;++i)
+        {
+            reply[i]=READ_PERI_REG(UART_FIFO(0)) & 0xFF;
+        }
+        char buf[128];
+        clrscr();
+        showIP(addr);
+        line2();
+        if(reply[8]==computeCRC(reply))
+        {
+            char bufScr[128];
+            COLevel=reply[2]*256+reply[3];
+            const int8_t temp=reply[4]-40;
+            os_sprintf(buf,"%d %d OK\n",COLevel,temp);
+            os_sprintf(bufScr,"%d ppm %d""\xef""c",COLevel,temp);
+            alignPrint(bufScr);
+        }
+        else
+        {
+            os_sprintf(buf,"~ ~ ERROR\n");    
+            while((READ_PERI_REG(UART_STATUS(0))>>UART_RXFIFO_CNT_S) &UART_RXFIFO_CNT)
+            {
+                volatile int t=READ_PERI_REG(UART_FIFO(0));
+            }
+            printStr("--==COMM ERR==--");
+        }
+
+        append_buffer(buf);
+    }   
+}
+
 static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
 {
-        os_printf("next timer round %d\n",nTicks);
+
+            getMeasurements();
 
 
-        if(is_sending && ++sender_watchdog==4 )
-        {
-            at_tcpclient_sent_cb(0);
 
-        }
-
-        for(tcp_streamer* current=streamsOut;current;current=current->next)
-        {
-            if(current->mode==LongPoll )
-            {
-                if(--current->timer == 0)
-                {
-                    os_printf("timeout - sending status, current sending is %d\n",is_sending);
-                    const char status ='0';//+getPinStatus();
-                    strBuf send;
-
-                    sendStatus(status,&send);
-                    sendStringNoCopy(current,&send);
-
-                }
-                else
-                {
-                    os_printf("no timeout, current sending is %d\n",is_sending);
-                }
-            }            
-        }
-        os_printf("long polls processed\n");
-
-
-        ++nTicks;
         // Структура с информацией о полученном, ip адресе клиента STA, маске подсети, шлюзе.
         struct ip_info ipConfig;
         // Отключаем таймер проверки wi-fi
@@ -123,14 +256,22 @@ static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
                 uart0_sendStr("Start TCP connecting...\r\n");
         #endif
 
+                addr=ipConfig.ip.addr;
                 if(!connected)
                 {
+                    clrscr();
+                    showIP(addr);
                     senddata();
                 }
                 connected=true;
+
+
+
+
                 // Запускаем таймер проверки соединения и отправки данных уже раз в 5 сек, см. тех.задание
                 os_timer_setfn(&WiFiLinker, (os_timer_func_t *)wifi_check_ip, NULL);
                 os_timer_arm(&WiFiLinker, 1000, 0);
+
         }
         else
         {
@@ -178,236 +319,31 @@ static void ICACHE_FLASH_ATTR wifi_check_ip(void *arg)
         }
 }
 
-void begin_new_sending()
-{
-    for(tcp_streamer* current=streamsOut; current; current=current->next)
-    {
-        const StreamMode md=current->mode;
-        switch(md)
-        {
-            case SendString:
-                current->mode=KillMeNoDisconnect;
-            break;
-            case SendFile:
-                current->mode=File;
-            break;
-            case LogDumpHeaders:
-                current->mode=LogDump;
-            break;
-            default:
-                continue;
-        }
-        os_printf("send header mode=%d -> %d\n",md,current->mode);
-
-        current_sending=current->pEspCon;
-
-
-        espconn_sent(current->pEspCon, current->string.begin, current->string.len);
-        os_printf("send header done\n",md,current->mode);
-
-        log_free(current->string.begin);
-        LOG_CLIENT("next headers sent",current->pEspCon);
-
-        return;
-    }
-
-    os_printf("no next headers\n");
-    is_sending=false;
-}
 
 static void ICACHE_FLASH_ATTR at_tcpclient_sent_cb(void *arg)
 {
-    sender_watchdog=0;
-    struct espconn *pespconn = (struct espconn *)arg;
-    os_printf("end writing to TCP %d\n");
-
-    if(streamsOut)
-    {
-        switch(streamsOut->mode)
-        {
-            case File:
-                os_printf("file\n");
-                if(arg)
-                {
-                    send_item(streamsOut);
-                }
-                else
-                {
-                    os_printf("force file send\n");
-                    delete_tcp_streamer_item(&streamsOut, streamsOut);
-                    begin_new_sending();
-                }
-            break;
-            case LogDump:
-            {
-                os_printf("sending part of log\n");
-
-                if(arg)
-                {
-                    current_sending=streamsOut->pEspCon;
-                    espconn_sent(streamsOut->pEspCon,  streamsOut->logPos->message.begin, streamsOut->logPos->message.len);
-                    const log_entry* tnext=streamsOut->logPos->next;
-
-    //                os_printf("message free %d\n",cur->logPos->message.begin);
-                    log_free(streamsOut->logPos->message.begin);
-
-    //                os_printf("node free %d\n",cur->logPos);
-                    log_free(streamsOut->logPos);
-
-
-                    if(tnext)
-                    {
-                        streamsOut->logPos=tnext;
-                    }
-                    else
-                    {
-    //                    os_printf("all data sent\n");
-                        streamsOut->mode=KillMeNoDisconnect;
-                    }
-    //                os_printf("sending done\n");
-
-                }
-                else
-                {
-                    os_printf("force log clean\n");
-                    for(log_entry* le=streamsOut->logPos; le; )
-                    {
-                        log_entry* t=le->next;
-                        log_free(le->message.begin);
-                        log_free(le);
-                        le=t;
-                    }
-                    delete_tcp_streamer_item(&streamsOut, streamsOut);
-                    begin_new_sending();
-                }
-
-                break;
-            }
-            case KillMe:
-                os_printf("force disconnect\n");
-                if(pespconn)
-                {
-                    espconn_disconnect(pespconn);
-                }
-            case KillMeNoDisconnect:
-                os_printf("kill no disconnect\n");
-                delete_tcp_streamer_item(&streamsOut, streamsOut);
-                if(pespconn)
-                {
-                    LOG_CLIENT("Query done",pespconn);
-                }
-                begin_new_sending();
-            break;
-        }        
-//        if(streamsOut)
-//        {
-//            tcp_streamer** current=&streamsOut;
-//            for(;*current;current=&(*current)->next);
-//            *current=streamsOut;
-//            streamsOut=streamsOut->next;
-//            (*current)->next=0;
-//        }
-    }
-    else
-    {
-        os_printf("ITEM NOT FOUND\n");
-    }
+    --nClients;
+    espconn_disconnect(arg);
 }
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_recv_cb(void *arg,char *pdata, unsigned short len)
 {
-    os_printf("new data from client");
-    struct espconn *pespconn = (struct espconn *)arg;
-
-    tcp_streamer* f=find_item(streamsInp,pespconn);
-
-    const strBuf inputMessage={pdata,len};
-
-
-
-    if(f)
-    {
-        strBuf tbuf;
-        append(2,&tbuf, &f->string, &inputMessage);
-        log_free(f->string.begin);
-
-        if(doReply(&tbuf, pespconn))
-        {
-            f->string=tbuf;
-            LOG_CLIENT("New partial query part",pespconn);
-        }
-        else
-        {
-            log_free(tbuf.begin);
-            delete_tcp_streamer_item(&streamsInp,f);
-            LOG_CLIENT("New partial query assembled",pespconn);
-        }
-    }
-    else
-    {
-        if(doReply(&inputMessage,pespconn))
-        {
-            LOG_CLIENT("New partial query",pespconn);
-
-            tcp_streamer* s = add_tcp_streamer_item(&streamsInp);
-
-            setCon(s,pespconn);
-
-            s->mode=Head;
-
-            copy(&inputMessage,&s->string);
-        }
-        else
-        {
-            LOG_CLIENT("New full query",pespconn);
-        }
-    }
+    espconn_sent(arg,bufferTitle,bufferLen+headerLen);
 }
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_discon_cb(void *arg)
 {     
-        struct espconn *pespconn = (struct espconn *)arg;
-        // Отключились, освобождаем память
-       LOG_CLIENT("Client disconnect",pespconn);
 
-       bool someDeleted = false;
-
-       while(true)
-       {
-           tcp_streamer* cur=find_socket(streamsOut,pespconn);
-
-           if(cur)
-           {
-               os_printf("delete sending queue\n");
-               delete_tcp_streamer_item(&streamsOut, cur);
-               someDeleted=true;
-           }
-           else
-           {
-               os_printf("not found in queue\n");
-               break;
-           }
-       }
-
-       if(is_sending && someDeleted)
-       {
-            os_printf("restart sending\n");
-            begin_new_sending();
-       }
-
-        --nClients;
-
-
-        os_printf("client disconnect finally\n");
+   //     os_printf("client disconnect finally\n");
 }
 
 
 
 static void ICACHE_FLASH_ATTR at_tcpclient_connect_cb(void *arg)
 {
-        os_printf("new connect");
+     //   os_printf("new connect");
         struct espconn *pespconn = (struct espconn *)arg;
         #ifdef PLATFORM_DEBUG
         uart0_sen mem_usage+=size;
@@ -425,33 +361,32 @@ static void ICACHE_FLASH_ATTR at_tcpclient_connect_cb(void *arg)
         espconn_regist_disconcb(pespconn, at_tcpclient_discon_cb);
 
         ++nClients;
-
-        LOG_CLIENT("Client connected",pespconn);
-
-}
-
-
-void BtnInit()
-{
-
-
 }
 
 //Init function 
 void ICACHE_FLASH_ATTR user_init()
 {
-    uart_div_modify(0, UART_CLK_FREQ / 9600);
+            UartDev.baut_rate = 9600;
+            uart_config(0);
+            uart_config(1);
+            clrscr();
+            printStr("Looking for WiFi");
 
-            MAKE_STR_BUF(systemInit,"Init system\n");
-            MAKE_STR_BUF(systemInitDone,"Init done\n");
-            MAKE_STR_BUF(wifiConfigSet,"WiFi SET\n");
+            buffer=os_zalloc(BUFFER_MAX);
 
-            add_message_copy(&systemInit, nTicks);
+            static const char header[]="ppm\t\C\tStatus\n";
+            headerLen=strlen(header);
 
+            BUFFER_MAX-=headerLen;
 
+            memcpy(buffer,header,headerLen);
 
-            os_printf("uint8 *buf", 8);
-//            system_set_os_print(0);
+            bufferTitle=buffer;
+
+            buffer+=headerLen;
+
+            memset(buffer,'\n',BUFFER_MAX);
+            system_set_os_print(0);
 
 
             // Структура с информацией о конфигурации STA (в режиме клиента AP)
@@ -476,15 +411,10 @@ void ICACHE_FLASH_ATTR user_init()
                     wifi_station_set_config(&stationConfig);
             }
 
-            add_message_copy(&wifiConfigSet, nTicks);
             // Для отладки выводим в uart данные о настройке режима STA
 
             // Запускаем таймер проверки соединения по Wi-Fi, проверяем соединение раз в 1 сек., если соединение установлено, то запускаем TCP-клиент и отправляем тестовую строку.
             os_timer_disarm(&WiFiLinker);
             os_timer_setfn(&WiFiLinker, (os_timer_func_t *)wifi_check_ip, NULL);
-            os_timer_arm(&WiFiLinker, 1000, 0);
-            // Инициализируем GPIO,
-            BtnInit();
-            // Выводим сообщение о успешном запуске
-            add_message_copy(&systemInitDone, nTicks);
+            os_timer_arm(&WiFiLinker, 1000, 0);            
 }

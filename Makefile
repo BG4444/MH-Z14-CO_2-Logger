@@ -31,7 +31,7 @@ ESPPORT		?= /dev/ttyUSB0
 TARGET		= app
 
 # which modules (subdirectories) of the project to include in compiling
-MODULES		= driver user ESPWEB
+MODULES		= driver user
 EXTRA_INCDIR    = include
 
 # libraries used in this project, mainly provided by the SDK
@@ -129,7 +129,7 @@ $(FW_BASE):
 	$(Q) mkdir -p $@
 
 flash: $(FW_FILE_1) $(FW_FILE_2)
-	$(ESPTOOL) --port $(ESPPORT) --baud 9600 write_flash $(FW_FILE_1_ADDR) $(FW_FILE_1) $(FW_FILE_2_ADDR) $(FW_FILE_2) 
+	python esptool-ftdi.py /usr/bin/$(ESPTOOL) --port $(ESPPORT) --baud 115200 write_flash $(FW_FILE_1_ADDR) $(FW_FILE_1) $(FW_FILE_2_ADDR) $(FW_FILE_2) 
 
 clean:
 	$(Q) rm -rf $(FW_BASE) $(BUILD_BASE)

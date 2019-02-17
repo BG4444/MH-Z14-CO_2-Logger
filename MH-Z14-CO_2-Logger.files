@@ -8,8 +8,7 @@ ESPWEB/tar.h
 ESPWEB/tcp_streamer.c
 ESPWEB/tcp_streamer.h
 ESPWEB/websrvr.c
-ESPWEB/websrvr.h
-user/www.c
 Makefile
+include/driver/uart.h
 user/user_config.h
 user/user_main.c

@@ -29,12 +29,15 @@ LOCAL void uart0_rx_intr_handler(void *para);
  * Parameters   : uart_no, use UART0 or UART1 defined ahead
  * Returns      : NONE
 *******************************************************************************/
-LOCAL void ICACHE_FLASH_ATTR
+void ICACHE_FLASH_ATTR
 uart_config(uint8 uart_no)
-{
-    if (uart_no == UART1) {
+{        
+    if (uart_no == UART1)
+    {
         PIN_FUNC_SELECT(PERIPHS_IO_MUX_GPIO2_U, FUNC_U1TXD_BK);
-    } else {
+    }
+    else
+    {
         /* rcv_buff size if 0x100 */
         ETS_UART_INTR_ATTACH(uart0_rx_intr_handler,  &(UartDev.rcv_buff));
         PIN_PULLUP_DIS(PERIPHS_IO_MUX_U0TXD_U);
@@ -116,6 +119,7 @@ uart0_rx_intr_handler(void *para)
     /* uart0 and uart1 intr combine togther, when interrupt occur, see reg 0x3ff20020, bit2, bit0 represents
      * uart1 and uart0 respectively
      */
+    os_printf("zool");
     RcvMsgBuff *pRxBuff = (RcvMsgBuff *)para;
     uint8 RcvChar;
 
@@ -125,12 +129,15 @@ uart0_rx_intr_handler(void *para)
 
     WRITE_PERI_REG(UART_INT_CLR(UART0), UART_RXFIFO_FULL_INT_CLR);
 
-    while (READ_PERI_REG(UART_STATUS(UART0)) & (UART_RXFIFO_CNT << UART_RXFIFO_CNT_S)) {
+    while (READ_PERI_REG(UART_STATUS(UART0)) & (UART_RXFIFO_CNT << UART_RXFIFO_CNT_S))
+    {
         RcvChar = READ_PERI_REG(UART_FIFO(UART0)) & 0xFF;
 
         /* you can add your handle code below.*/
 
         *(pRxBuff->pWritePos) = RcvChar;
+
+        uart1_tx_one_char(RcvChar);
 
         // insert here for get one command line from uart
         if (RcvChar == '\r') {
@@ -154,8 +161,7 @@ uart0_rx_intr_handler(void *para)
  *                uint16 len - buffer len
  * Returns      :
 *******************************************************************************/
-void ICACHE_FLASH_ATTR
-uart0_tx_buffer(uint8 *buf, uint16 len)
+void ICACHE_FLASH_ATTR uart0_tx_buffer(uint8 *buf, uint16 len)
 {
     uint16 i;
 
